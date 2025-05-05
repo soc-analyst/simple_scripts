@@ -1,0 +1,6 @@
+{
+    "taniumServer": "https://tanium.yourcompany.com/api/v2",
+    "dashboardName": "SecurityCompliance",
+    "outputBaseDir": "C:\\TaniumResults",
+    "certificatePath": "C:\\Certificates\\tanium-cert.pfx"
+}

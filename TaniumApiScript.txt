@@ -1,0 +1,497 @@
+# Determine the script's directory
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$configFile = Join-Path -Path $scriptDir -ChildPath "TaniumConfig.json"
+
+# Function to read configuration from JSON file
+function Read-Configuration {
+    <#
+    .SYNOPSIS
+        Reads configuration settings from a JSON file.
+    .OUTPUTS
+        PSCustomObject containing configuration settings.
+    #>
+    Write-Log "Reading configuration from $configFile"
+    if (-not (Test-Path $configFile)) {
+        Write-Log "Configuration file $configFile not found" -Level ERROR
+        exit 1
+    }
+    try {
+        $config = Get-Content -Path $configFile -Raw | ConvertFrom-Json
+        Write-Log "Configuration loaded successfully"
+        return $config
+    } catch {
+        Write-Log "Failed to read configuration file: $_" -Level ERROR
+        exit 1
+    }
+}
+
+# Function to load custom certificate
+function Get-CustomCertificate {
+    <#
+    .SYNOPSIS
+        Loads a custom certificate from the specified path.
+    .PARAMETER CertificatePath
+        The file path to the certificate.
+    .OUTPUTS
+        X509Certificate object or $null if not provided.
+    #>
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$CertificatePath
+    )
+    if (-not [string]::IsNullOrEmpty($CertificatePath) -and (Test-Path $CertificatePath)) {
+        Write-Log "Loading custom certificate from $CertificatePath"
+        try {
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+            $cert.Import($CertificatePath)
+            Write-Log "Custom certificate loaded successfully"
+            return $cert
+        } catch {
+            Write-Log "Failed to load custom certificate: $_" -Level ERROR
+            exit 1
+        }
+    } else {
+        Write-Log "No valid certificate path provided; proceeding without custom certificate" -Level WARNING
+        return $null
+    }
+}
+
+# Load configuration
+$config = Read-Configuration
+$taniumServer = $config.taniumServer
+$dashboardName = $config.dashboardName
+$outputBaseDir = $config.outputBaseDir
+$certificatePath = $config.certificatePath
+
+# Load custom certificate
+$customCertificate = Get-CustomCertificate -CertificatePath $certificatePath
+
+# Define variables for output paths
+$executionTime = Get-Date -Format "yyyyMMdd_HHmm"  # Timestamp for unique output directory
+$outputDir = Join-Path -Path $outputBaseDir -ChildPath $executionTime  # Output directory with timestamp
+$combinedCsvPath = Join-Path -Path $outputDir -ChildPath "CombinedResults.csv"  # Path for combined CSV
+$logFile = Join-Path -Path $outputDir -ChildPath "TaniumScript.log"  # Path for log file
+$sessionStateFile = Join-Path -Path $outputBaseDir -ChildPath "SessionState.json"  # Path for session state
+
+# Function to write to log file with timestamp
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Writes a message to the log file with a timestamp.
+    .PARAMETER Message
+        The message to log.
+    .PARAMETER Level
+        The log level (INFO, WARNING, ERROR).
+    #>
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$Level] $Message"
+    if (-not (Test-Path $outputDir)) {
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    }
+    Add-Content -Path $logFile -Value $logMessage -Encoding UTF8
+    Write-Host $logMessage  # Also output to console for real-time monitoring
+}
+
+# Function to save session state
+function Save-SessionState {
+    <#
+    .SYNOPSIS
+        Saves the current session state to a JSON file.
+    .PARAMETER ProcessedQuestions
+        Array of question IDs that have been processed.
+    .PARAMETER CurrentQuestionId
+        The ID of the current question being processed.
+    #>
+    param (
+        [array]$ProcessedQuestions,
+        [string]$CurrentQuestionId
+    )
+    $state = @{
+        ProcessedQuestions = $ProcessedQuestions
+        CurrentQuestionId = $CurrentQuestionId
+        ExecutionTime = $executionTime
+    }
+    $state | ConvertTo-Json | Out-File -FilePath $sessionStateFile -Encoding UTF8
+    Write-Log "Saved session state to $sessionStateFile"
+}
+
+# Function to load session state
+function Get-SessionState {
+    <#
+    .SYNOPSIS
+        Loads the session state from the JSON file if it exists.
+    .OUTPUTS
+        Hashtable containing the session state, or $null if no state exists.
+    #>
+    if (Test-Path $sessionStateFile) {
+        $state = Get-Content -Path $sessionStateFile -Raw | ConvertFrom-Json
+        Write-Log "Loaded session state from $sessionStateFile"
+        return $state
+    }
+    Write-Log "No session state found at $sessionStateFile"
+    return $null
+}
+
+# Function to securely prompt for and retrieve Tanium credentials
+function Get-TaniumCredentials {
+    <#
+    .SYNOPSIS
+        Prompts the user for Tanium credentials and returns a PSCredential object.
+    .OUTPUTS
+        PSCredential object containing the username and password.
+    #>
+    Write-Log "Prompting for Tanium credentials"
+    $credential = Get-Credential -Message "Enter your Tanium username and password"
+    if ($null -eq $credential) {
+        Write-Log "No credentials provided. Exiting script." -Level ERROR
+        exit 1
+    }
+    Write-Log "Credentials successfully obtained"
+    return $credential
+}
+
+# Function to generate or regenerate a Tanium session token
+function Get-TaniumSessionToken {
+    <#
+    .SYNOPSIS
+        Authenticates with the Tanium server and retrieves a session token.
+    .PARAMETER Credential
+        PSCredential object containing the username and password.
+    .PARAMETER ServerUrl
+        The URL of the Tanium server API.
+    .OUTPUTS
+        String containing the session token.
+    #>
+    param (
+        [Parameter(Mandatory=$true)]
+        [PSCredential]$Credential,
+        [Parameter(Mandatory=$true)]
+        [string]$ServerUrl
+    )
+    Write-Log "Generating session token for user $($Credential.UserName)"
+    $body = @{
+        username = $Credential.UserName
+        password = $Credential.GetNetworkCredential().Password
+    } | ConvertTo-Json
+    try {
+        $restParams = @{
+            Uri = "$ServerUrl/session"
+            Method = "Post"
+            Body = $body
+            ContentType = "application/json"
+            ErrorAction = "Stop"
+        }
+        if ($null -ne $customCertificate) {
+            $restParams.Certificate = $customCertificate
+        }
+        $response = Invoke-RestMethod @restParams
+        Write-Log "Session token generated successfully"
+        return $response.session
+    } catch {
+        Write-Log "Failed to generate session token: $_" -Level ERROR
+        Save-SessionState -ProcessedQuestions $processedQuestions -CurrentQuestionId $null
+        exit 1
+    }
+}
+
+# Function to retrieve saved question IDs from a dashboard
+function Get-DashboardQuestionIds {
+    <#
+    .SYNOPSIS
+        Retrieves the saved question IDs associated with a specified dashboard.
+    .PARAMETER DashboardName
+        The name of the dashboard.
+    .PARAMETER Headers
+        Hashtable containing HTTP headers, including the session token.
+    .PARAMETER ServerUrl
+        The URL of the Tanium server API.
+    .OUTPUTS
+        Array of saved question IDs.
+    #>
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$DashboardName,
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Headers,
+        [Parameter(Mandatory=$true)]
+        [string]$ServerUrl
+    )
+    Write-Log "Retrieving dashboards to find '$DashboardName'"
+    try {
+        $restParams = @{
+            Uri = "$ServerUrl/dashboards"
+            Method = "Get"
+            Headers = $Headers
+            ErrorAction = "Stop"
+        }
+        if ($null -ne $customCertificate) {
+            $restParams.Certificate = $customCertificate
+        }
+        $dashboards = Invoke-RestMethod @restParams
+        $dashboard = $dashboards | Where-Object { $_.name -eq $DashboardName }
+        if ($null -eq $dashboard) {
+            Write-Log "Dashboard '$DashboardName' not found" -Level ERROR
+            Save-SessionState -ProcessedQuestions @() -CurrentQuestionId $null
+            exit 1
+        }
+        $questionIds = $dashboard.questions.id
+        Write-Log "Found $($questionIds.Count) saved questions in dashboard '$DashboardName'"
+        return $questionIds
+    } catch {
+        Write-Log "Failed to retrieve dashboard questions: $_" -Level ERROR
+        Save-SessionState -ProcessedQuestions @() -CurrentQuestionId $null
+        exit 1
+    }
+}
+
+# Ensure the output directory exists
+Write-Log "Checking for output directory: $outputDir"
+if (-not (Test-Path $outputDir)) {
+    try {
+        New-Item -ItemType Directory -Path $outputDir -ErrorAction Stop | Out-Null
+        Write-Log "Created output directory: $outputDir"
+    } catch {
+        Write-Log "Failed to create output directory: $_" -Level ERROR
+        exit 1
+    }
+}
+
+# Get credentials and generate initial session token
+$credential = Get-TaniumCredentials
+$sessionToken = Get-TaniumSessionToken -Credential $credential -ServerUrl $taniumServer
+$headers = @{
+    "session" = $sessionToken
+    "Content-Type" = "application/json"
+}
+
+# Retrieve saved question IDs from the dashboard
+$savedQuestionIds = Get-DashboardQuestionIds -DashboardName $dashboardName -Headers $headers -ServerUrl $taniumServer
+
+# Load session state to resume if applicable
+$sessionState = Get-SessionState
+$processedQuestions = @()
+$currentQuestionId = $null
+if ($null -ne $sessionState -and $sessionState.ExecutionTime -eq $executionTime) {
+    $processedQuestions = $sessionState.ProcessedQuestions
+    $currentQuestionId = $sessionState.CurrentQuestionId
+    Write-Log "Resuming execution. Processed questions: $($processedQuestions -join ', ')"
+}
+
+# Initialize an array to store all results for combining
+$allResults = @()
+
+# Function to wait for a Tanium question to complete
+function Wait-TaniumQuestion {
+    <#
+    .SYNOPSIS
+        Polls the Tanium server until a question completes or times out.
+    .PARAMETER QuestionId
+        The ID of the question to monitor.
+    .PARAMETER MaxWaitSeconds
+        Maximum time to wait for completion (default: 300 seconds).
+    .PARAMETER PollIntervalSeconds
+        Interval between status checks (default: 5 seconds).
+    .PARAMETER Headers
+        Hashtable containing HTTP headers, including the session token.
+    .PARAMETER ServerUrl
+        The URL of the Tanium server API.
+    .OUTPUTS
+        Boolean indicating whether the question completed successfully.
+    #>
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$QuestionId,
+        [int]$MaxWaitSeconds = 300,
+        [int]$PollIntervalSeconds = 5,
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Headers,
+        [Parameter(Mandatory=$true)]
+        [string]$ServerUrl
+    )
+    Write-Log "Waiting for question $QuestionId to complete"
+    $startTime = Get-Date
+    while ($true) {
+        try {
+            $restParams = @{
+                Uri = "$ServerUrl/result_infos/$QuestionId"
+                Method = "Get"
+                Headers = $Headers
+                ErrorAction = "Stop"
+            }
+            if ($null -ne $customCertificate) {
+                $restParams.Certificate = $customCertificate
+            }
+            $response = Invoke-RestMethod @restParams
+            if ($response.status -eq "complete") {
+                Write-Log "Question $QuestionId completed successfully"
+                return $true
+            }
+        } catch {
+            if ($_.Exception.Response.StatusCode -eq 401) {
+                Write-Log "Session token expired for question $QuestionId. Regenerating token." -Level WARNING
+                $newToken = Get-TaniumSessionToken -Credential $credential -ServerUrl $ServerUrl
+                $Headers["session"] = $newToken
+                continue
+            }
+            Write-Log "Error checking status for question $QuestionId: $_" -Level WARNING
+        }
+        if (((Get-Date) - $startTime).TotalSeconds -ge $MaxWaitSeconds) {
+            Write-Log "Timeout waiting for question $QuestionId after $MaxWaitSeconds seconds" -Level WARNING
+            return $false
+        }
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+}
+
+# Process each saved question ID
+$startProcessing = $currentQuestionId -eq $null
+foreach ($questionId in $savedQuestionIds) {
+    # Skip questions already processed unless resuming at the current question
+    if (-not $startProcessing -and $questionId -eq $currentQuestionId) {
+        $startProcessing = $true
+    }
+    if (-not $startProcessing -or $questionId -in $processedQuestions) {
+        Write-Log "Skipping question $questionId (already processed)"
+        continue
+    }
+
+    Write-Log "Processing saved question ID: $questionId"
+    Save-SessionState -ProcessedQuestions $processedQuestions -CurrentQuestionId $questionId
+    
+    # Execute the saved question to generate a new question instance
+    $body = @{
+        id = $questionId
+    } | ConvertTo-Json
+    try {
+        $restParams = @{
+            Uri = "$taniumServer/questions"
+            Method = "Post"
+            Headers = $headers
+            Body = $body
+            ErrorAction = "Stop"
+        }
+        if ($null -ne $customCertificate) {
+            $restParams.Certificate = $customCertificate
+        }
+        $response = Invoke-RestMethod @restParams
+        $newQuestionId = $response.id
+        Write-Log "Successfully executed question $questionId. New question ID: $newQuestionId"
+    } catch {
+        if ($_.Exception.Response.StatusCode -eq 401) {
+            Write-Log "Session token expired. Regenerating token." -Level WARNING
+            $headers["session"] = Get-TaniumSessionToken -Credential $credential -ServerUrl $taniumServer
+            $restParams = @{
+                Uri = "$taniumServer/questions"
+                Method = "Post"
+                Headers = $headers
+                Body = $body
+                ErrorAction = "Stop"
+            }
+            if ($null -ne $customCertificate) {
+                $restParams.Certificate = $customCertificate
+            }
+            $response = Invoke-RestMethod @restParams
+            $newQuestionId = $response.id
+            Write-Log "Successfully executed question $questionId after token refresh. New question ID: $newQuestionId"
+        } else {
+            Write-Log "Failed to execute question $questionId: $_" -Level ERROR
+            Save-SessionState -ProcessedQuestions $processedQuestions -CurrentQuestionId $questionId
+            exit 1
+        }
+    }
+
+    # Wait for the question to complete and retrieve results
+    if (Wait-TaniumQuestion -QuestionId $newQuestionId -Headers $headers -ServerUrl $taniumServer) {
+        try {
+            $restParams = @{
+                Uri = "$taniumServer/result_data/question/$newQuestionId"
+                Method = "Get"
+                Headers = $headers
+                ErrorAction = "Stop"
+            }
+            if ($null -ne $customCertificate) {
+                $restParams.Certificate = $customCertificate
+            }
+            $results = Invoke-RestMethod @restParams
+            $outputFile = Join-Path -Path $outputDir -ChildPath "Question_$questionId.json"
+            $results | ConvertTo-Json -Depth 10 | Out-File -FilePath $outputFile -Encoding utf8 -ErrorAction Stop
+            Write-Log "Results for question $questionId saved to $outputFile"
+
+            # Parse the results into a collection of custom objects for combining
+            $resultRows = $results.rows | ForEach-Object {
+                $row = @{}
+                for ($i = 0; $i -lt $_.data.Count; $i++) {
+                    $columnName = $results.columns[$i].name
+                    $row[$columnName] = $_.data[$i]
+                }
+                [PSCustomObject]$row
+            }
+            $allResults += $resultRows
+            $processedQuestions += $questionId
+            Save-SessionState -ProcessedQuestions $processedQuestions -CurrentQuestionId $null
+        } catch {
+            if ($_.Exception.Response.StatusCode -eq 401) {
+                Write-Log "Session token expired while downloading results. Regenerating token." -Level WARNING
+                $headers["session"] = Get-TaniumSessionToken -Credential $credential -ServerUrl $taniumServer
+                $restParams = @{
+                    Uri = "$taniumServer/result_data/question/$newQuestionId"
+                    Method = "Get"
+                    Headers = $headers
+                    ErrorAction = "Stop"
+                }
+                if ($null -ne $customCertificate) {
+                    $restParams.Certificate = $customCertificate
+                }
+                $results = Invoke-RestMethod @restParams
+                $outputFile = Join-Path -Path $outputDir -ChildPath "Question_$questionId.json"
+                $results | ConvertTo-Json -Depth 10 | Out-File -FilePath $outputFile -Encoding utf8 -ErrorAction Stop
+                Write-Log "Results for question $questionId saved to $outputFile after token refresh"
+
+                # Parse the results into a collection of custom objects for combining
+                $resultRows = $results.rows | ForEach-Object {
+                    $row = @{}
+                    for ($i = 0; $i -lt $_.data.Count; $i++) {
+                        $columnName = $results.columns[$i].name
+                        $row[$columnName] = $_.data[$i]
+                    }
+                    [PSCustomObject]$row
+                }
+                $allResults += $resultRows
+                $processedQuestions += $questionId
+                Save-SessionState -ProcessedQuestions $processedQuestions -CurrentQuestionId $null
+            } else {
+                Write-Log "Failed to download results for question $questionId: $_" -Level ERROR
+                Save-SessionState -ProcessedQuestions $processedQuestions -CurrentQuestionId $questionId
+                exit 1
+            }
+        }
+    } else {
+        Write-Log "Skipping results for question $questionId due to timeout" -Level WARNING
+        Save-SessionState -ProcessedQuestions $processedQuestions -CurrentQuestionId $questionId
+    }
+}
+
+# Combine all results and export to a CSV file
+if ($allResults.Count -gt 0) {
+    try {
+        $allResults | Export-Csv -Path $combinedCsvPath -NoTypeInformation -Encoding utf8 -ErrorAction Stop
+        Write-Log "Combined results exported to $combinedCsvPath"
+    } catch {
+        Write-Log "Failed to export combined results to CSV: $_" -Level ERROR
+        Save-SessionState -ProcessedQuestions $processedQuestions -CurrentQuestionId $null
+        exit 1
+    }
+} else {
+    Write-Log "No results were collected to combine into CSV" -Level WARNING
+}
+
+# Clear session state if execution completes successfully
+if (Test-Path $sessionStateFile) {
+    Remove-Item -Path $sessionStateFile -Force
+    Write-Log "Cleared session state file after successful execution"
+}
